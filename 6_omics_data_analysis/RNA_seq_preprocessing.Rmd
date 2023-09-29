@@ -1,0 +1,215 @@
+---
+title: "PPMI RNA-seq preprocessing"
+author: "Jacqueline Maasch"
+date: "10/15/2021"
+output: 
+  html_document:
+    toc: true
+---
+
+Data preprocessing of RNA-seq raw counts and experimental metadata.
+
+## Preamble.
+
+```{r setup, echo = FALSE, results = "hide", message = FALSE}
+
+# Data manipulation
+library(dplyr)
+
+# Print versioning.
+sessionInfo()
+
+```
+
+### Read data.
+
+```{r read}
+
+# Read count and metadata.
+setwd("source")
+df <- read.csv("PPMI_rna_counts.csv")   # For RNA-seq counts.
+df_ <- read.csv("PPMI_rna_counts.csv", check.names=FALSE)
+meta <- read.csv("metaDataIR3.csv")     # For gender, diagnosis (PD, HC).
+meta2 <- read.csv("patient_info.csv")   # For age at baseline.
+labels <- read.csv("subtypes.csv")      # For subphenotype label.
+
+# Read protein coding gene IDs (Ensembl).
+#setwd("../uniprot_proteome/")
+protein_coding_genes <- read.csv("uniprot_annotated_proteome_transcript-to-gene-id.csv")
+
+# Access genome.
+# (FASTQ files were aligned to the GRCh38 human genome [Craig et al 2021]).
+# genome <- BSgenome.Hsapiens.NCBI.GRCh38
+
+```
+
+## Process data.
+
+### Construct metadata.
+
+```{r process}
+
+# Set gene names to row names.
+row.names(df) <- df[,1]
+df <- df[,-c(1)]
+
+row.names(df_) <- df_[,1]
+df_ <- df_[,-c(1)]
+```
+
+
+```{r process}
+
+# Extract patient IDs, visit, sample ID, and phase.
+strip <- function(x, id_idx = 4) { return(strsplit(x, "[.]")[[1]][[id_idx]]) }
+strip_sample <- function(x, id_idx = 4) { return(strsplit(x, ".", fixed = TRUE)[[1]][[id_idx]]) }
+
+list_id <- lapply(names(df[,-c(1)]), strip)
+list_visit <- lapply(names(df[,-c(1)]), strip, id_idx = 5)
+#list_sample <- lapply(names(df[,-c(1)]), strip, id_idx = 6)
+list_phase <- lapply(names(df[,-c(1)]), strip, id_idx = 2)
+list_sample_new <- lapply(names(df_[,-c(1)]), strip_sample, id_idx = 4)
+
+
+# Construct metadata dataframe.
+df_meta <- data.frame(ID = unlist(list_id),
+                      Visit = unlist(list_visit),
+                      Sample = unlist(list_sample_new),
+                      Phase = unlist(list_phase))
+
+df_meta$Long.ID <- paste(df_meta$ID, 
+                         df_meta$Visit, 
+                         df_meta$Sample, 
+                         df_meta$Phase, 
+                         sep = ".")
+
+# Rename columns on count data with simplified nomenclature.
+names(df) <- c("Length", df_meta$Long.ID)
+
+# Merge diagnosis labels with metadata.
+names(meta)[names(meta) == "PATNO"] <- "ID"
+diagnosis_gender <- unique(meta[c("ID", "DIAGNOSIS", "GENDER")])
+df_meta <- merge(df_meta, 
+                 diagnosis_gender, 
+                 by = "ID",
+                 all = FALSE)
+names(df_meta)[names(df_meta) == "DIAGNOSIS"] <- "Diagnosis"
+names(df_meta)[names(df_meta) == "GENDER"] <- "Gender"
+
+# Merge subphenotype labels with metadata.
+names(labels)[names(labels) == "PATNO"] <- "ID"
+df_meta <- merge(df_meta, 
+                 labels, 
+                 by = "ID",
+                 all = TRUE)
+
+# Merge age at baseline with metadata.
+age <- meta2[, c("PATNO", "Age_at_baseline")]
+names(age)[names(age) == "PATNO"] <- "ID"
+names(age)[names(age) == "Age_at_baseline"] <- "Age.Baseline"
+df_meta <- merge(df_meta, 
+                 age, 
+                 by = "ID",
+                 all.x = TRUE)
+
+
+# Merge plate and usable_bases with metadata
+P_UB <- meta[, c("Specimen.Bar.Code", "Plate", "PCT_USABLE_BASES")]
+names(P_UB)[names(P_UB) == "Specimen.Bar.Code"] <- "Sample"
+names(P_UB)[names(P_UB) == "PCT_USABLE_BASES"] <- "Usable_bases"
+df_meta <- merge(df_meta,
+                 P_UB,
+                 by = "Sample",
+                 all.x = TRUE)
+
+# Extract controls and subphenotyped patients.
+df_control <- df_meta[df_meta$Diagnosis == "Control", ]
+df_meta <- df_meta[df_meta$Diagnosis != "Control", ]
+df_control$Subtype <- "Control"
+#df_control$Age.Baseline <- -1
+df_meta <- rbind(df_meta, df_control)
+
+# Create one-vs-all label to compare subtype III to subtypes I and II.
+df_meta$One.vs.All <- "Control"
+df_meta$One.vs.All[df_meta$Subtype == "I"] <- "Other"
+df_meta$One.vs.All[df_meta$Subtype == "II"] <- "Other"
+df_meta$One.vs.All[df_meta$Subtype == "III"] <- "III"
+
+# Remove patients with incomplete data.
+df_meta <- df_meta[df_meta["Gender"] != "Unk", ]
+df_meta <- na.omit(df_meta)
+row.names(df_meta) <- NULL 
+
+# Map visit label to integer value.
+map <- setNames(c(0, 2, 4, 6, 8), 
+                c("BL", "V02", "V04", "V06", "V08"))
+df_meta$Visit[] <- map[unlist(df_meta$Visit)]
+df_meta$Visit <- as.numeric(df_meta$Visit)
+
+# Test for duplicates.
+length(df_meta[duplicated(df_meta),]$ID)
+
+```
+
+### Assess missingness.
+
+**Exclude patients with too few visits:** Patients must have at least two visits to be included.
+
+```{r missingness}
+
+# # Compute visits per patient ID.
+# visit_counts <- table(df_meta$ID)
+# 
+# # Extract IDs for at least 2 visits.
+# ids_min2 <- names(visit_counts[visit_counts >= 2])
+# 
+# # Eliminate patients with fewer than 2 visits.
+# df_meta <- df_meta[df_meta$ID %in% ids_min2, ]
+
+### 587 of 599 individual patients (97.99%) had 2 or more visits. ###
+
+```
+
+### Subset count data.
+
+```{r subset}
+
+# Subset count data by samples with valid metadata only.
+df_subset <- subset(df, 
+                    select = c("Length", df_meta$Long.ID))
+
+# Keep protein coding genes only.
+all_genes <- as.character(lapply(row.names(df_subset), strip, id_idx = 1))
+keep_genes <- all_genes %in% protein_coding_genes$ensembl_gene_id
+df_subset <- df_subset[keep_genes, ]
+
+# Test how many ID'd protein coding genes are present in PPMI data.
+table(keep_genes)[[2]] # Total present.
+table(keep_genes)[[2]] / length(protein_coding_genes$ensembl_gene_id) * 100 # % present.
+length(protein_coding_genes$ensembl_gene_id) - table(keep_genes)[[2]] # Total not present.
+
+```
+
+### Export processed data.
+
+```{r export}
+
+#setwd("../ppmi_data_processed")
+
+# Write subsetted count data to CSV.
+write.csv(df_subset,
+          "ppmi_rna_counts_subetted_age_gender_protein_coding.csv") # Keep row names.
+
+# Write subsetted metadata to CSV.
+write.csv(df_meta,
+          "ppmi_rna_counts_subetted_metadata_age_gender.csv",
+          row.names = FALSE) # Do not keep row names.
+
+```
+
+
+
+
+
+
+

@@ -1,0 +1,402 @@
+---
+title: "PPMI differential expression analysis with DESeq2"
+output: 
+  html_document:
+    toc: true
+---
+
+Subtype III vs healthy controls. Gender as covariate. Protein-coding genes only.
+
+Code adapted largely from: 
+
+* http://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+* https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#pvaluesNA
+
+## Preamble.
+
+```{r setup, results = "hide"}
+
+#####################
+### Importations. ###
+#####################
+
+# Differential expression analysis.
+#library(edgeR)
+library(DESeq2)
+
+# Pathway enrichment analysis.
+library(gprofiler2)
+
+# Data manipulation and visualization.
+library(tidyr)
+library(ggplot2)
+library(ggthemes)
+
+# Color palettes.
+library(sanzo)
+#library(ashR)
+
+library(EnhancedVolcano)
+
+# Print versioning.
+sessionInfo()
+
+```
+
+## Read data.
+
+```{r read, warning = FALSE}
+
+# Read raw count data and metadata, previously subsetted.
+#setwd("../../../data_files/ppmi_data_processed/")
+df_counts <- read.csv(
+                      "ppmi_rna_counts_subetted_age_gender_protein_coding.csv",
+                      check.names = FALSE) # Prevents prependage of "X" on headers.
+df_meta <- read.csv(
+                       "ppmi_rna_counts_subetted_metadata_age_gender.csv",
+                    check.names = FALSE)
+
+```
+
+## Process data.
+
+### Process dataframes.
+
+```{r process}
+
+# Set row names to long-form ID for compatibility with DESeq2.
+row.names(df_meta) <- df_meta$Long.ID
+
+# Set row names to gene names and drop column.
+row.names(df_counts) <- df_counts[,1]
+df_counts <- df_counts[,-c(1)]
+
+# Store and drop gene length column.
+gene_lengths <- data.frame(Length = df_counts[,1])
+row.names(gene_lengths) <- row.names(df_counts)
+df_counts <- df_counts[,-c(1)]
+dim(df_counts)
+
+# Subset metadata to exclude subtypes I/III.
+df_meta <- df_meta[df_meta$Subtype != "I",]
+df_meta <- df_meta[df_meta$Subtype != "III",]
+
+# Subset metadata to exclude all visits but baseline (0).
+#df_meta <- df_meta[df_meta$Visit == 0,]
+
+# Subset count data by valid metadata only.
+df_counts <- subset(df_counts, 
+                    select = c(df_meta$Long.ID))
+
+# Set data types to facilitate DE analysis.
+df_meta$Visit <- as.numeric(df_meta$Visit)
+df_meta$One.vs.All <- factor(df_meta$One.vs.All)
+df_meta$Subtype <- factor(df_meta$Subtype)
+df_meta$Diagnosis <- factor(df_meta$Diagnosis)
+df_meta$Gender <- factor(df_meta$Gender)
+df_meta$Phase <- factor(df_meta$Phase)
+df_meta$Plate <- factor(df_meta$Plate)
+
+
+# Test that row names of metadata are in same order as 
+# column names of count data.
+all(rownames(df_meta) == colnames(df_counts))
+
+# View counts per label.
+table(df_meta$Subtype)
+
+```
+
+## DESeq2 differential expression analysis.
+
+```{r deseq2}
+
+# Construct DESeqDataSet from count data and metadata.
+# Used to store input values, intermediate calculations, and results.
+dds <- DESeqDataSetFromMatrix(countData = df_counts,
+                              colData = df_meta,
+                              design = ~ Gender + Age.Baseline + Subtype) # Plate + Usable_bases + 
+dds
+
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+
+# Specify reference level, i.e. level to compare against / control group.
+# Alphabetical by default.
+#dds$Subtype <- relevel(dds$Subtype, ref = "Control")
+dds$Subtype <- factor(dds$Subtype, levels=c('Control', 'II'))
+
+# Differential expression analysis.
+dds <- DESeq(dds)
+de_results <- results(dds, 
+                      #alpha = 0.05, # Adjusted p-value threshold for significance.
+                      contrast = c("Subtype","II","Control")) # Which level as denominator? Case then control.
+de_results
+
+# Count NAs.
+length(de_results$padj)
+sum(is.na(de_results$padj))
+sum(is.na(de_results$padj)) / length(de_results$padj)
+sum(is.na(de_results$pvalue))
+sum(is.na(de_results$pvalue)) / length(de_results$pvalue)
+
+
+write.csv(de_results, 'dge_ii_vs_hc.csv')
+```
+
+
+
+
+
+```{r shrink}
+summary(results(dds, alpha=0.05))
+
+
+# plot some genes
+par(mfrow=c(2,3))
+
+plotCounts(dds, gene="ENSG00000284662.1", intgroup="Subtype")
+plotCounts(dds, gene="ENSG00000187634.11", intgroup="Subtype")
+plotCounts(dds, gene="ENSG00000188976.10", intgroup="Subtype")
+plotCounts(dds, gene="ENSG00000187961.13", intgroup="Subtype")
+plotCounts(dds, gene="ENSG00000187583.10", intgroup="Subtype")
+plotCounts(dds, gene="ENSG00000198727.2", intgroup="Subtype")
+```
+
+```{r shrink}
+# Volcano Plot
+
+EnhancedVolcano(de_results,
+    lab = rownames(de_results),
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    pCutoff = 0.05,
+    FCcutoff = 0.2,
+)
+```
+
+```{r shrink}
+# (unevaluated code chunk)
+library("IHW")
+resIHW <- results(dds, filterFun=ihw)
+summary(resIHW)
+sum(resIHW$padj < 0.1, na.rm=TRUE)
+metadata(resIHW)$ihwResult
+```
+
+
+
+### Log-fold change shrinkage for visualization and ranking.
+
+```{r shrink}
+
+# View coefficient names.
+resultsNames(dds)
+
+# Shrink effect size (LFC estimates) using apeglm method (Zhu, Ibrahim, Love 2018).
+# NOTE: "If used in published research, please cite: Zhu, A., Ibrahim, J.G., Love, M.I. (2018) Heavy-tailed prior distributions for sequence count data: removing the noise and preserving large differences. Bioinformatics. https://doi.org/10.1093/bioinformatics/bty895
+de_results_shrink <- lfcShrink(dds, 
+                               coef = "Subtype_III_vs_Control", 
+                               type = "apeglm")
+
+# Assess how many adjusted p-values changed due to shrinkage.
+sum(is.na(de_results$pvalue))
+sum(is.na(de_results_shrink$pvalue))
+sum(is.na(de_results$padj))
+sum(is.na(de_results_shrink$padj))
+sum(is.na(de_results_shrink$padj)) / length(de_results_shrink$padj) * 100
+
+# View results.
+de_results_shrink
+
+plotMA(de_results_shrink)
+
+# Extract observations with invalid adjusted p-values.
+df_invalid <- as.data.frame(de_results_shrink[is.na(de_results_shrink$padj), ])
+df_valid <- as.data.frame(de_results_shrink[!is.na(de_results_shrink$padj), ])
+
+
+```
+
+### Assess DE based on adjusted p-values.
+
+```{r p_adj}
+
+# Order adjusted p-values in ascending order.
+de_results <- de_results[order(de_results$padj), ]
+summary(de_results)
+
+# Total genes with significant adjusted p-values (< 0.05).
+# NOTE: NA values are excluded.
+sum(de_results$padj < 0.05, 
+    na.rm = TRUE)
+
+# Plot log_2-fold changes attributable to a given variable over 
+# the mean of normalized counts for all samples.
+plotMA(de_results)
+
+# Extract DE genes.
+df_de_padj <- as.data.frame(de_results)
+de_genes_padj <- df_de_padj[df_de_padj$padj < 0.05, ]
+mean(de_genes_padj$padj)
+de_genes_padj <- de_genes_padj %>% drop_na()
+
+# How many genes are DE?
+length(de_genes_padj$padj)
+
+```
+
+### Assess DE based on adjusted p-values with effect size shrinkage.
+
+```{r p_adj_shrink}
+
+# Order adjusted p-values in ascending order.
+de_results_shrink <- de_results_shrink[order(de_results_shrink$padj), ]
+summary(de_results_shrink)
+
+# Total genes with significant adjusted p-values (< 0.05).
+# NOTE: NA values are excluded.
+sum(de_results_shrink$padj < 0.05, 
+    na.rm = TRUE)
+
+# Plot log_2-fold changes attributable to a given variable over 
+# the mean of normalized counts for all samples.
+plotMA(de_results_shrink)
+
+# Extract DE genes.
+df_de_padj_shrink <- as.data.frame(de_results_shrink)
+de_genes_padj_shrink <- df_de_padj_shrink[df_de_padj_shrink$padj < 0.05, ]
+mean(de_genes_padj_shrink$padj)
+de_genes_padj_shrink <- de_genes_padj_shrink %>% drop_na()
+
+# How many genes are DE?
+length(de_genes_padj_shrink$padj)
+
+```
+
+```{r test_equal}
+
+# Test whether shrinkage impacts DE gene determination.
+all(rownames(de_genes_padj_shrink) == rownames(de_genes_padj))
+
+```
+
+## Pathway enrichment analysis.
+
+### Process data for `g:Profiler`.
+
+```{r pea_process}
+
+# Strip chars following "." to get gene Ensembl IDs.
+# Note: Using results with shrinkage.
+strip <- function(x, id_idx = 4) { return(strsplit(x, "[.]")[[1]][[id_idx]]) }
+genes_padj <- lapply(rownames(de_genes_padj_shrink), strip, id_idx = 1)
+
+# Convert to character vector for compatibility with g:Profiler.
+genes_padj <- as.character(genes_padj)
+
+# Test that stripping decimal did not introduce redundancies.
+length(unique(genes_padj)) == length(genes_padj)
+
+```
+
+### PE determination by adjusted p-value.
+
+#### Test for over-representation.
+
+```{r pea_padj_over}
+
+# Query g:Profiler (ordered by adjusted p-values).
+pea_padj_over <- gost(query = genes_padj,
+                      organism = "hsapiens",
+                      significant = FALSE,
+                      ordered_query = TRUE)
+
+# Extract dataframe containing enrichment analysis results.
+head(pea_padj_over$result)
+
+# Extract named list containing metadata for the query.
+# head(pea_padj_over$meta)
+
+# View significance counts.
+table(pea_padj_over$result$significant)
+
+# View genes of significance.
+df_sig_padj_over <- pea_padj_over$result[pea_padj_over$result$significant == TRUE,]
+length(df_sig_padj_over$significant)
+df_sig_padj_over
+sig_terms_padj_over <- df_sig_padj_over$term_name
+sig_terms_padj_over
+
+
+# Create Manhattan plot of functional enrichment results.
+plot_padj_over <- gostplot(pea_padj_over,
+                           capped = TRUE, 
+                           interactive = FALSE) 
+plot_padj_over
+
+```
+
+#### Test for under-representation.
+
+```{r pea_padj_under}
+
+# Query g:Profiler (ordered by adjusted p-values).
+pea_padj_under <- gost(query = genes_padj,
+                       organism = "hsapiens",
+                       significant = FALSE,
+                       measure_underrepresentation = TRUE,
+                       ordered_query = TRUE)
+
+# Extract dataframe containing enrichment analysis results.
+head(pea_padj_under$result)
+
+# Extract named list containing metadata for the query.
+# head(pea_padj_under$meta)
+
+# View significance counts.
+table(pea_padj_under$result$significant)
+
+# View genes of significance.
+df_sig_padj_under <- pea_padj_under$result[pea_padj_under$result$significant == TRUE,]
+length(df_sig_padj_under$significant)
+df_sig_padj_under
+sig_terms_padj_under <- df_sig_padj_under$term_name
+sig_terms_padj_under
+
+# Create Manhattan plot of functional enrichment results.
+plot_padj_under <- gostplot(pea_padj_under,
+                            capped = TRUE, 
+                            interactive = FALSE) 
+plot_padj_under
+
+```
+
+## Export DE gene and enriched pathway lists.
+
+```{r export}
+
+# Export as CSV.
+write.csv(data.frame(Gene = genes_padj), 
+          file = "de_genes_padj.csv", 
+          row.names = FALSE,
+          quote = FALSE)
+
+# Export PEA results as CSV.
+df_pea_padj <- as.data.frame(pea_padj_under$result)
+df_pea_padj <- df_pea_padj[order(df_pea_padj$p_value), ]
+df_pea_padj <- apply(df_pea_padj, 2, as.character)
+write.csv(df_pea_padj, 
+          file = "pea_padj.csv", 
+          row.names = FALSE,
+          quote = FALSE)
+
+```
+
+
+
+
+
+
+
+
